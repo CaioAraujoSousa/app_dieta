@@ -175,4 +175,28 @@ class DBHelper {
     final res = await dbClient.query('daily_logs', where: 'date = ?', whereArgs: [date]);
     return res.map((e) => DailyLog.fromMap(e)).toList();
   }
+  static Future<Map<String, dynamic>> getWeeklyStats() async {
+    final dbClient = await db;
+    
+    // Busca logs registrados nos últimos 7 dias
+    final List<Map<String, dynamic>> res = await dbClient.rawQuery('''
+      SELECT percentage FROM daily_logs 
+      ORDER BY id DESC LIMIT 35
+    ''');
+
+    if (res.isEmpty) {
+      return {'percentage': 0.0, 'totalLogs': 0};
+    }
+
+    double total = 0;
+    for (var row in res) {
+      total += (row['percentage'] as num).toDouble();
+    }
+
+    double average = (total / res.length) * 100;
+    return {
+      'percentage': average,
+      'totalLogs': res.length,
+    };
+  }
 }
