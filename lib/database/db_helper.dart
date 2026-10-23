@@ -1,3 +1,4 @@
+import 'package:intl/intl.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import '../models/meal.dart';
@@ -161,13 +162,18 @@ class DBHelper {
     return res.map((e) => Meal.fromMap(e)).toList();
   }
 
+  // Cada refeição do dia tem um único registro: tocar de novo substitui o anterior.
+  // (A tabela não tem UNIQUE, então só o ConflictAlgorithm.replace duplicava linhas.)
   static Future<void> saveLog(DailyLog log) async {
     final dbClient = await db;
-    await dbClient.insert(
-      'daily_logs',
-      log.toMap(),
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await dbClient.transaction((txn) async {
+      await txn.delete(
+        'daily_logs',
+        where: 'date = ? AND mealPeriod = ?',
+        whereArgs: [log.date, log.mealPeriod],
+      );
+      await txn.insert('daily_logs', log.toMap());
+    });
   }
 
   static Future<List<DailyLog>> getLogsByDate(String date) async {
@@ -175,14 +181,20 @@ class DBHelper {
     final res = await dbClient.query('daily_logs', where: 'date = ?', whereArgs: [date]);
     return res.map((e) => DailyLog.fromMap(e)).toList();
   }
+
   static Future<Map<String, dynamic>> getWeeklyStats() async {
     final dbClient = await db;
-    
-    // Busca logs registrados nos últimos 7 dias
-    final List<Map<String, dynamic>> res = await dbClient.rawQuery('''
-      SELECT percentage FROM daily_logs 
-      ORDER BY id DESC LIMIT 35
-    ''');
+
+    // Hoje + os 6 dias anteriores (as datas yyyy-MM-dd comparam certo como texto).
+    final String since = DateFormat('yyyy-MM-dd')
+        .format(DateTime.now().subtract(const Duration(days: 6)));
+
+    final List<Map<String, dynamic>> res = await dbClient.query(
+      'daily_logs',
+      columns: ['percentage'],
+      where: 'date >= ?',
+      whereArgs: [since],
+    );
 
     if (res.isEmpty) {
       return {'percentage': 0.0, 'totalLogs': 0};

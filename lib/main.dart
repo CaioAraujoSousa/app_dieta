@@ -7,8 +7,15 @@ import 'models/daily_log.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService.init();
-  await NotificationService.scheduleMealNotifications();
+
+  // Se as notificações falharem (ex.: permissão de alarme), o app abre mesmo assim.
+  try {
+    await NotificationService.init();
+    await NotificationService.scheduleMealNotifications();
+  } catch (e) {
+    debugPrint('Erro ao configurar notificações: $e');
+  }
+
   runApp(const DietApp());
 }
 
@@ -62,10 +69,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _screens,
-      ),
+      // Mostra só a aba atual: assim cada aba recarrega os dados do banco
+      // toda vez que é aberta (o IndexedStack deixava a Disciplina congelada).
+      body: _screens[_currentIndex],
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
         onDestinationSelected: (index) {
@@ -106,7 +112,8 @@ class TodayTab extends StatefulWidget {
 }
 
 class _TodayTabState extends State<TodayTab> {
-  final String _todayDate = DateFormat('yyyy-MM-DD').format(DateTime.now());
+  // dd = dia do mês (DD seria o dia do ano e geraria datas como 2026-10-296)
+  final String _todayDate = DateFormat('yyyy-MM-dd').format(DateTime.now());
   Map<String, DailyLog> _todayLogs = {};
   bool _isLoading = true;
 
@@ -130,6 +137,7 @@ class _TodayTabState extends State<TodayTab> {
     for (var log in logs) {
       logMap[log.mealPeriod] = log;
     }
+    if (!mounted) return;
     setState(() {
       _todayLogs = logMap;
       _isLoading = false;
@@ -144,7 +152,7 @@ class _TodayTabState extends State<TodayTab> {
       percentage: percentage,
     );
     await DBHelper.saveLog(log);
-    _loadTodayLogs();
+    await _loadTodayLogs();
   }
 
   double _calculateDayScore() {
@@ -350,10 +358,21 @@ class _MenuTabState extends State<MenuTab> {
             child: FutureBuilder<List<Meal>>(
               future: DBHelper.getMealsByPeriod(_selectedPeriod),
               builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text('Erro ao carregar o cardápio:\n${snapshot.error}'),
+                    ),
+                  );
+                }
                 if (!snapshot.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
                 final meals = snapshot.data!;
+                if (meals.isEmpty) {
+                  return const Center(child: Text('Nenhuma refeição encontrada.'));
+                }
                 final meal = meals.firstWhere(
                   (m) => m.option == _selectedOption,
                   orElse: () => meals.first,
@@ -438,6 +457,7 @@ class _ProgressTabState extends State<ProgressTab> {
 
   Future<void> _loadStats() async {
     final stats = await DBHelper.getWeeklyStats();
+    if (!mounted) return;
     setState(() {
       _weeklyScore = stats['percentage'];
       _totalLogs = stats['totalLogs'];
@@ -454,6 +474,8 @@ class _ProgressTabState extends State<ProgressTab> {
           : RefreshIndicator(
               onRefresh: _loadStats,
               child: ListView(
+                // Sem isso, o puxar-para-atualizar não funciona com lista curta no Android.
+                physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.all(16),
                 children: [
                   Card(
@@ -484,7 +506,7 @@ class _ProgressTabState extends State<ProgressTab> {
                           ),
                           const SizedBox(height: 8),
                           Text(
-                            '$_totalLogs refeições registradas no histórico recente.',
+                            '$_totalLogs refeições registradas nos últimos 7 dias.',
                             style: const TextStyle(fontSize: 12, color: Colors.grey),
                           ),
                         ],
