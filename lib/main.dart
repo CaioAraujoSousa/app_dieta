@@ -1,22 +1,29 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
 import 'services/notification_service.dart';
+
 import 'package:intl/intl.dart';
+
 import 'database/db_helper.dart';
 import 'models/meal.dart';
 import 'models/daily_log.dart';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  runApp(const DietApp());
+  // Sem await: o app abre sem esperar as notificações (nem o pedido de permissão).
+  unawaited(_setupNotifications());
+}
 
-  // Se as notificações falharem (ex.: permissão de alarme), o app abre mesmo assim.
+Future<void> _setupNotifications() async {
   try {
     await NotificationService.init();
     await NotificationService.scheduleMealNotifications();
   } catch (e) {
     debugPrint('Erro ao configurar notificações: $e');
   }
-
-  runApp(const DietApp());
 }
 
 class DietApp extends StatelessWidget {
@@ -60,17 +67,13 @@ class MainNavigationScreen extends StatefulWidget {
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _currentIndex = 0;
 
-  final List<Widget> _screens = const [
-    TodayTab(),
-    MenuTab(),
-    ProgressTab(),
-  ];
+  final List<Widget> _screens = const [TodayTab(), MenuTab(), ProgressTab()];
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       // Mostra só a aba atual: assim cada aba recarrega os dados do banco
-      // toda vez que é aberta (o IndexedStack deixava a Disciplina congelada).
+      // toda vez que é aberta.
       body: _screens[_currentIndex],
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
@@ -111,9 +114,9 @@ class TodayTab extends StatefulWidget {
   State<TodayTab> createState() => _TodayTabState();
 }
 
-class _TodayTabState extends State<TodayTab> {
-  // dd = dia do mês (DD seria o dia do ano e geraria datas como 2026-10-296)
-  final String _todayDate = DateFormat('yyyy-MM-dd').format(DateTime.now());
+class _TodayTabState extends State<TodayTab> with WidgetsBindingObserver {
+  late String _todayDate;
+  Timer? _midnightTimer;
   Map<String, DailyLog> _todayLogs = {};
   bool _isLoading = true;
 
@@ -125,26 +128,82 @@ class _TodayTabState extends State<TodayTab> {
     {'key': 'ceia', 'label': 'Ceia', 'time': '22:00'},
   ];
 
+  // dd = dia do mês (DD seria o dia do ano)
+  String _formatToday() => DateFormat('yyyy-MM-dd').format(DateTime.now());
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _todayDate = _formatToday();
     _loadTodayLogs();
+    _scheduleMidnightRefresh();
+  }
+
+  @override
+  void dispose() {
+    _midnightTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // Quando o app volta do segundo plano, confere se o dia mudou.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshIfNewDay();
+      _scheduleMidnightRefresh();
+    }
+  }
+
+  // Programa uma atualização para a próxima meia-noite (00:00:01).
+  void _scheduleMidnightRefresh() {
+    _midnightTimer?.cancel();
+    final now = DateTime.now();
+    final nextMidnight = DateTime(now.year, now.month, now.day + 1);
+    _midnightTimer = Timer(
+      nextMidnight.difference(now) + const Duration(seconds: 1),
+      () {
+        _refreshIfNewDay();
+        _scheduleMidnightRefresh();
+      },
+    );
+  }
+
+  // Se o dia virou, zera a tela e carrega os registros do novo dia.
+  // Os registros dos dias anteriores continuam no banco (usados na Disciplina).
+  void _refreshIfNewDay() {
+    if (!mounted) return;
+    final today = _formatToday();
+    if (today != _todayDate) {
+      setState(() {
+        _todayDate = today;
+        _todayLogs = {};
+      });
+      _loadTodayLogs();
+    }
   }
 
   Future<void> _loadTodayLogs() async {
-    final logs = await DBHelper.getLogsByDate(_todayDate);
+    final dateToLoad = _todayDate;
+    final logs = await DBHelper.getLogsByDate(dateToLoad);
+    if (!mounted || dateToLoad != _todayDate) return;
     final Map<String, DailyLog> logMap = {};
     for (var log in logs) {
       logMap[log.mealPeriod] = log;
     }
-    if (!mounted) return;
     setState(() {
       _todayLogs = logMap;
       _isLoading = false;
     });
   }
 
-  Future<void> _recordLog(String periodKey, double percentage, String option) async {
+  Future<void> _recordLog(
+    String periodKey,
+    double percentage,
+    String option,
+  ) async {
+    _refreshIfNewDay();
     final log = DailyLog(
       date: _todayDate,
       mealPeriod: periodKey,
@@ -164,12 +223,29 @@ class _TodayTabState extends State<TodayTab> {
     return (total / _periods.length) * 100;
   }
 
+  Future<void> _testNotifications() async {
+    final message = await NotificationService.sendTestNotifications();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
   @override
   Widget build(BuildContext context) {
     double dayScore = _calculateDayScore();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Hoje')),
+      appBar: AppBar(
+        title: const Text('Hoje'),
+        actions: [
+          // Botão TEMPORÁRIO para testar notificações; depois removemos.
+          IconButton(
+            icon: const Icon(Icons.notifications_active_outlined),
+            tooltip: 'Testar notificação',
+            onPressed: _testNotifications,
+          ),
+        ],
+      ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
@@ -178,8 +254,11 @@ class _TodayTabState extends State<TodayTab> {
                 // Card de Progresso do Dia
                 Card(
                   elevation: 0,
-                  color: Theme.of(context).colorScheme.primaryContainer.withAlpha(50),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  color: Theme.of(context).colorScheme.primaryContainer
+                      .withAlpha(50),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                   child: Padding(
                     padding: const EdgeInsets.all(20),
                     child: Row(
@@ -220,10 +299,12 @@ class _TodayTabState extends State<TodayTab> {
                             ),
                             Text(
                               '${_todayLogs.length}/${_periods.length}',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            )
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
                           ],
-                        )
+                        ),
                       ],
                     ),
                   ),
@@ -245,7 +326,10 @@ class _TodayTabState extends State<TodayTab> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: ListTile(
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
                       title: Text(
                         p['label']!,
                         style: const TextStyle(fontWeight: FontWeight.bold),
@@ -259,7 +343,9 @@ class _TodayTabState extends State<TodayTab> {
                             IconButton(
                               icon: Icon(
                                 Icons.check_circle,
-                                color: log?.percentage == 1.0 ? Colors.green : Colors.grey[300],
+                                color: log?.percentage == 1.0
+                                    ? Colors.green
+                                    : Colors.grey[300],
                               ),
                               onPressed: () => _recordLog(p['key']!, 1.0, 'A'),
                               tooltip: 'Comi tudo (100%)',
@@ -267,7 +353,9 @@ class _TodayTabState extends State<TodayTab> {
                             IconButton(
                               icon: Icon(
                                 Icons.pie_chart,
-                                color: log?.percentage == 0.5 ? Colors.orange : Colors.grey[300],
+                                color: log?.percentage == 0.5
+                                    ? Colors.orange
+                                    : Colors.grey[300],
                               ),
                               onPressed: () => _recordLog(p['key']!, 0.5, 'A'),
                               tooltip: 'Comi metade (50%)',
@@ -275,7 +363,9 @@ class _TodayTabState extends State<TodayTab> {
                             IconButton(
                               icon: Icon(
                                 Icons.cancel,
-                                color: log?.percentage == 0.0 ? Colors.red : Colors.grey[300],
+                                color: log?.percentage == 0.0
+                                    ? Colors.red
+                                    : Colors.grey[300],
                               ),
                               onPressed: () => _recordLog(p['key']!, 0.0, 'A'),
                               tooltip: 'Não comi (0%)',
@@ -320,12 +410,15 @@ class _MenuTabState extends State<MenuTab> {
       appBar: AppBar(title: const Text('Receitas & Dieta')),
       body: Column(
         children: [
-          // Seletor de Período
+          // Seletor de Período (Wrap: se não couber numa linha, quebra para a seguinte)
           Container(
+            width: double.infinity,
             color: Colors.white,
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+            child: Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 8,
+              runSpacing: 4,
               children: _periodOptions.map((p) {
                 bool isSelected = p['key'] == _selectedPeriod;
                 return ChoiceChip(
@@ -362,7 +455,9 @@ class _MenuTabState extends State<MenuTab> {
                   return Center(
                     child: Padding(
                       padding: const EdgeInsets.all(16),
-                      child: Text('Erro ao carregar o cardápio:\n${snapshot.error}'),
+                      child: Text(
+                        'Erro ao carregar o cardápio:\n${snapshot.error}',
+                      ),
                     ),
                   );
                 }
@@ -371,7 +466,9 @@ class _MenuTabState extends State<MenuTab> {
                 }
                 final meals = snapshot.data!;
                 if (meals.isEmpty) {
-                  return const Center(child: Text('Nenhuma refeição encontrada.'));
+                  return const Center(
+                    child: Text('Nenhuma refeição encontrada.'),
+                  );
                 }
                 final meal = meals.firstWhere(
                   (m) => m.option == _selectedOption,
@@ -383,24 +480,40 @@ class _MenuTabState extends State<MenuTab> {
                   children: [
                     Text(
                       meal.title,
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Row(
                       children: [
                         Chip(
-                          avatar: const Icon(Icons.local_fire_department, size: 16),
-                          label: Text('${meal.minCalories}-${meal.maxCalories} kcal'),
+                          avatar: const Icon(
+                            Icons.local_fire_department,
+                            size: 16,
+                          ),
+                          label: Text(
+                            '${meal.minCalories}-${meal.maxCalories} kcal',
+                          ),
                         ),
                         const SizedBox(width: 8),
                         Chip(
                           avatar: const Icon(Icons.fitness_center, size: 16),
-                          label: Text('${meal.minProtein}-${meal.maxProtein}g Proteína'),
+                          label: Text(
+                            '${meal.minProtein}-${meal.maxProtein}g Proteína',
+                          ),
                         ),
                       ],
                     ),
                     const SizedBox(height: 16),
-                    const Text('Ingredientes:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                    const Text(
+                      'Ingredientes:',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ),
+                    ),
                     const SizedBox(height: 8),
                     Container(
                       padding: const EdgeInsets.all(12),
@@ -409,10 +522,19 @@ class _MenuTabState extends State<MenuTab> {
                         borderRadius: BorderRadius.circular(8),
                         border: Border.all(color: Colors.grey.shade300),
                       ),
-                      child: Text(meal.ingredients, style: const TextStyle(height: 1.4)),
+                      child: Text(
+                        meal.ingredients,
+                        style: const TextStyle(height: 1.4),
+                      ),
                     ),
                     const SizedBox(height: 16),
-                    const Text('Modo de Preparo:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                    const Text(
+                      'Modo de Preparo:',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ),
+                    ),
                     const SizedBox(height: 8),
                     Container(
                       padding: const EdgeInsets.all(12),
@@ -421,7 +543,10 @@ class _MenuTabState extends State<MenuTab> {
                         borderRadius: BorderRadius.circular(8),
                         border: Border.all(color: Colors.grey.shade300),
                       ),
-                      child: Text(meal.instructions, style: const TextStyle(height: 1.4)),
+                      child: Text(
+                        meal.instructions,
+                        style: const TextStyle(height: 1.4),
+                      ),
                     ),
                   ],
                 );
@@ -489,7 +614,11 @@ class _ProgressTabState extends State<ProgressTab> {
                       padding: const EdgeInsets.all(20),
                       child: Column(
                         children: [
-                          const Icon(Icons.workspace_premium, size: 48, color: Colors.amber),
+                          const Icon(
+                            Icons.workspace_premium,
+                            size: 48,
+                            color: Colors.amber,
+                          ),
                           const SizedBox(height: 12),
                           const Text(
                             'Consistência Semanal',
@@ -507,7 +636,10 @@ class _ProgressTabState extends State<ProgressTab> {
                           const SizedBox(height: 8),
                           Text(
                             '$_totalLogs refeições registradas nos últimos 7 dias.',
-                            style: const TextStyle(fontSize: 12, color: Colors.grey),
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey,
+                            ),
                           ),
                         ],
                       ),
